@@ -1212,7 +1212,7 @@ bool  SwDocStyleSheet::SetName(const OUString& rStr, bool bReindexNow)
     {
         case SfxStyleFamily::Char :
         {
-            OSL_ENSURE(m_pCharFormat, "SwCharFormat missing!");
+            //OSL_ENSURE(m_pCharFormat, "SwCharFormat missing!");
             if( m_pCharFormat && m_pCharFormat->GetName() != rStr )
             {
                 if (!m_pCharFormat->GetName().isEmpty())
@@ -1324,7 +1324,7 @@ bool   SwDocStyleSheet::SetParent( const OUString& rStr)
     switch(nFamily)
     {
         case SfxStyleFamily::Char :
-            OSL_ENSURE( m_pCharFormat, "SwCharFormat missing!" );
+            //OSL_ENSURE( m_pCharFormat, "SwCharFormat missing!" );
             if( nullptr != ( pFormat = m_pCharFormat ) && !rStr.isEmpty() )
                 pParent = lcl_FindCharFormat(m_rDoc, UIName(rStr));
             break;

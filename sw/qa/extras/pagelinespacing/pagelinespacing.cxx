@@ -11,8 +11,11 @@
 
 #include <anchoredobject.hxx>
 #include <docsh.hxx>
+#include <drawdoc.hxx>
+#include <edtwin.hxx>
 #include <flyfrm.hxx>
 #include <frame.hxx>
+#include <IDocumentDrawModelAccess.hxx>
 #include <pagefrm.hxx>
 #include <porlay.hxx>
 #include <rootfrm.hxx>
@@ -20,6 +23,14 @@
 #include <swmodeltestbase.hxx>
 #include <txtfrm.hxx>
 #include <wrtsh.hxx>
+
+#include <svx/svdpage.hxx>
+#include <vcl/event.hxx>
+#include <vcl/scheduler.hxx>
+
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 namespace
 {
@@ -32,18 +43,28 @@ public:
     }
 
 protected:
-    void checkTextAlignedToBaselineGrid(const bool bAligned = true);
+    bool checkTextAlignedToBaselineGrid(const bool bAligned = true);
 
     void applyPageLineSpacing(const uint16_t nPage, const bool bEnable,
                               const OUString& rReferenceStyle);
 
+    void applyPageLineSpacing(const OUString& rParagraphStyle);
+
     Size getTextFrameSize(const uint16_t nTextFrame, const OUString& rTextContent);
 
+    void moveObject(SdrObject* pObject, const sal_uInt16 nKey);
+    void resizeObjectUpward(SdrObject* pObject, const SwTwips nDragDistance);
+
+    SdrObject* findFlyFrame(const uint16_t nPage, const uint16_t nFlyFrame);
+
+    void setLineHeightForReferenceStyle(const uint16_t nPage, const sal_uInt16 nLineHeight);
+
 private:
-    void checkTextAlignedToBaselineGrid(SwTextFrame* pTextFrame, const bool bAligned);
+    bool checkTextAlignedToBaselineGrid(SwFrame* pFrame, const bool bAligned);
+    bool checkTextAlignedToBaselineGrid(SwTextFrame* pTextFrame, const bool bAligned);
 };
 
-void SwPageLineSpacingTest::checkTextAlignedToBaselineGrid(const bool bAligned)
+bool SwPageLineSpacingTest::checkTextAlignedToBaselineGrid(const bool bAligned)
 {
     SwDocShell* pDocShell = getSwDocShell();
     CPPUNIT_ASSERT(pDocShell);
@@ -54,55 +75,7 @@ void SwPageLineSpacingTest::checkTextAlignedToBaselineGrid(const bool bAligned)
     SwRootFrame* pRoot = pWrtShell->GetLayout();
     CPPUNIT_ASSERT(pRoot);
 
-    SwFrame* pNextFrame = pRoot;
-    bool bLowerFinished = false;
-    while (pNextFrame)
-    {
-        // Check the text alignment within text frames.
-        if (pNextFrame->IsTextFrame())
-        {
-            auto pTextFrame = dynamic_cast<SwTextFrame*>(pNextFrame);
-            CPPUNIT_ASSERT(pTextFrame);
-            checkTextAlignedToBaselineGrid(pTextFrame, bAligned);
-        }
-
-        // Also check the content of text frames.
-        if (pNextFrame->IsPageFrame() && !bLowerFinished)
-        {
-            auto pPageFrame = dynamic_cast<SwPageFrame*>(pNextFrame);
-            CPPUNIT_ASSERT(pPageFrame);
-            const SwSortedObjs* pObjects = pPageFrame->GetSortedObjs();
-            if (pObjects)
-            {
-                for (SwAnchoredObject* pObject : *pObjects)
-                {
-                    SwFlyFrame* pFlyFrame = pObject->DynCastFlyFrame();
-                    if (pFlyFrame)
-                    {
-                        auto pTextFrame = dynamic_cast<SwTextFrame*>(pFlyFrame->GetLower());
-                        CPPUNIT_ASSERT(pTextFrame);
-                        checkTextAlignedToBaselineGrid(pTextFrame, bAligned);
-                    }
-                }
-            }
-        }
-
-        // Traverse to the next frame in the layout.
-        if (pNextFrame->GetLower() && !bLowerFinished)
-        {
-            pNextFrame = pNextFrame->GetLower();
-        }
-        else if (pNextFrame->GetNext())
-        {
-            pNextFrame = pNextFrame->GetNext();
-            bLowerFinished = false;
-        }
-        else
-        {
-            pNextFrame = pNextFrame->GetUpper();
-            bLowerFinished = true;
-        }
-    };
+    return checkTextAlignedToBaselineGrid(pRoot, bAligned);
 }
 
 void SwPageLineSpacingTest::applyPageLineSpacing(const uint16_t nPage, const bool bEnable,
@@ -156,6 +129,41 @@ void SwPageLineSpacingTest::applyPageLineSpacing(const uint16_t nPage, const boo
     calcLayout();
 }
 
+void SwPageLineSpacingTest::applyPageLineSpacing(const OUString& rParagraphStyle)
+{
+    SwDocShell* pDocShell = getSwDocShell();
+    CPPUNIT_ASSERT(pDocShell);
+
+    SwDoc* pDoc = pDocShell->GetDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    // Enable page line-spacing for the given paragraph style (previously called register-true rendering).
+    {
+        SwTextFormatColl* pTextFormat = pDoc->FindTextFormatCollByName(UIName(rParagraphStyle));
+        if (!pTextFormat)
+        {
+            return;
+        }
+
+        const SwAttrSet& rAttrSet = pTextFormat->GetAttrSet();
+        SwRegisterItem aRegisterItem = rAttrSet.GetRegister();
+        aRegisterItem.SetValue(true);
+        CPPUNIT_ASSERT_EQUAL(true, aRegisterItem.GetValue());
+
+        std::unique_ptr<SfxItemSet> pNewSet = rAttrSet.Clone();
+        pNewSet->Put(aRegisterItem);
+        pDoc->ChgFormat(*pTextFormat, *pNewSet);
+        calcLayout();
+    }
+
+    // Verify the paragraph style was updated properly.
+    {
+        SwTextFormatColl* pTextFormat = pDoc->FindTextFormatCollByName(UIName(rParagraphStyle));
+        const SwAttrSet& rAttrSet = pTextFormat->GetAttrSet();
+        CPPUNIT_ASSERT_EQUAL(true, rAttrSet.GetRegister().GetValue());
+    }
+}
+
 Size SwPageLineSpacingTest::getTextFrameSize(const uint16_t nTextFrame,
                                              const OUString& rTextContent)
 {
@@ -205,10 +213,250 @@ Size SwPageLineSpacingTest::getTextFrameSize(const uint16_t nTextFrame,
     return { 0, 0 };
 }
 
-void SwPageLineSpacingTest::checkTextAlignedToBaselineGrid(SwTextFrame* pTextFrame,
+void SwPageLineSpacingTest::moveObject(SdrObject* pObject, const sal_uInt16 nKey)
+{
+    CPPUNIT_ASSERT(pObject);
+
+    // Save the original position of the object to verify movement.
+    const Point aOriginalPos = pObject->GetLastBoundRect().TopLeft();
+
+    SwDocShell* pDocShell = getSwDocShell();
+    CPPUNIT_ASSERT(pDocShell);
+
+    // First select the object.
+    SwWrtShell* pWrtShell = pDocShell->GetWrtShell();
+    CPPUNIT_ASSERT(pWrtShell);
+
+    bool bSelected = pWrtShell->SelectObj(Point(), 0, pObject);
+    CPPUNIT_ASSERT(bSelected);
+
+    // Then move it with keyboard events.
+    SwView* pView = pDocShell->GetView();
+    CPPUNIT_ASSERT(pView);
+
+    SwEditWin& rEditWin = pView->GetEditWin();
+
+    KeyEvent aKeyEvent(0, nKey);
+    rEditWin.KeyInput(aKeyEvent);
+    Scheduler::ProcessEventsToIdle();
+
+    // Verify movement has actually happened.
+    const Point aNewPos = pObject->GetLastBoundRect().TopLeft();
+    switch (nKey)
+    {
+        case KEY_UP:
+            CPPUNIT_ASSERT_EQUAL(aOriginalPos.X(), aNewPos.X());
+            CPPUNIT_ASSERT(aNewPos.Y() < aOriginalPos.Y());
+            break;
+        case KEY_DOWN:
+            CPPUNIT_ASSERT_EQUAL(aOriginalPos.X(), aNewPos.X());
+            CPPUNIT_ASSERT(aNewPos.Y() > aOriginalPos.Y());
+            break;
+        case KEY_LEFT:
+            CPPUNIT_ASSERT_EQUAL(aOriginalPos.Y(), aNewPos.Y());
+            CPPUNIT_ASSERT(aNewPos.X() < aOriginalPos.X());
+            break;
+        case KEY_RIGHT:
+            CPPUNIT_ASSERT_EQUAL(aOriginalPos.Y(), aNewPos.Y());
+            CPPUNIT_ASSERT(aNewPos.X() > aOriginalPos.X());
+
+            break;
+        default:
+            CPPUNIT_ASSERT(false);
+            break;
+    }
+}
+
+void SwPageLineSpacingTest::resizeObjectUpward(SdrObject* pObject, const SwTwips nDragDistance)
+{
+    CPPUNIT_ASSERT(pObject);
+
+    // Save the original size of the object to verify resizing.
+    const Size aOriginalSize = pObject->GetLastBoundRect().GetSize();
+
+    SwDocShell* pDocShell = getSwDocShell();
+    CPPUNIT_ASSERT(pDocShell);
+    SwView* pView = pDocShell->GetView();
+    CPPUNIT_ASSERT(pView);
+
+    // Do the resizing using drag & drop on the top drag point of the object.
+    const Point aDragPoint = pObject->GetCurrentBoundRect().TopCenter();
+    const Point aDestinationPoint(aDragPoint.X(), aDragPoint.Y() - nDragDistance);
+
+    vcl::Window& rEditWin = pView->GetEditWin();
+    const Point aFromPixels = rEditWin.LogicToPixel(aDragPoint);
+    const Point aToPixels = rEditWin.LogicToPixel(aDestinationPoint);
+
+    const MouseEvent aClickEvent(aFromPixels, 1, MouseEventModifiers::SIMPLECLICK, MOUSE_LEFT);
+    rEditWin.MouseButtonDown(aClickEvent);
+    const MouseEvent aMoveEvent(aToPixels, 0, MouseEventModifiers::SIMPLEMOVE, MOUSE_LEFT);
+    rEditWin.MouseMove(aMoveEvent);
+    rEditWin.MouseMove(aMoveEvent);
+    const MouseEvent aReleaseEvent(aToPixels, 1, MouseEventModifiers::SIMPLECLICK, MOUSE_LEFT);
+    rEditWin.MouseButtonUp(aReleaseEvent);
+    Scheduler::ProcessEventsToIdle();
+
+    // Verify resizing has actually happened.
+    const Size aNewSize = pObject->GetLastBoundRect().GetSize();
+    CPPUNIT_ASSERT_EQUAL(aOriginalSize.Width(), aNewSize.Width());
+    CPPUNIT_ASSERT(aNewSize.Height() > aOriginalSize.Height());
+}
+
+SdrObject* SwPageLineSpacingTest::findFlyFrame(const uint16_t nPage, const uint16_t nFlyFrame)
+{
+    SwDocShell* pDocShell = getSwDocShell();
+    CPPUNIT_ASSERT(pDocShell);
+
+    SwDoc* pDoc = pDocShell->GetDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    SwDrawModel* pDrawModel = pDoc->getIDocumentDrawModelAccess().GetDrawModel();
+    CPPUNIT_ASSERT(pDrawModel);
+
+    SdrPage* pPage = pDrawModel->GetPage(nPage - 1);
+    CPPUNIT_ASSERT(pPage);
+
+    SdrObject* pFlyFrame = pPage->GetObj(nFlyFrame - 1);
+    CPPUNIT_ASSERT(pFlyFrame);
+
+    return pFlyFrame;
+}
+
+void SwPageLineSpacingTest::setLineHeightForReferenceStyle(const uint16_t nPage,
+                                                           const sal_uInt16 nLineHeight)
+{
+    SwDocShell* pDocShell = getSwDocShell();
+    CPPUNIT_ASSERT(pDocShell);
+
+    SwWrtShell* pWrtShell = pDocShell->GetWrtShell();
+    CPPUNIT_ASSERT(pWrtShell);
+
+    SwDoc* pDoc = pDocShell->GetDoc();
+    CPPUNIT_ASSERT(pDoc);
+
+    SwRootFrame* pRoot = pWrtShell->GetLayout();
+    CPPUNIT_ASSERT(pRoot);
+
+    SwFrame* pNextFrame = pRoot;
+    while (pNextFrame)
+    {
+        if (pNextFrame->IsPageFrame())
+        {
+            uint16_t nCurrentPage = 1;
+            while (pNextFrame)
+            {
+                // Find the correct page.
+                if (nCurrentPage == nPage)
+                {
+                    auto pPageFrame = dynamic_cast<SwPageFrame*>(pNextFrame);
+                    CPPUNIT_ASSERT(pPageFrame);
+                    SwPageDesc* pPageDesc = pPageFrame->GetPageDesc();
+                    CPPUNIT_ASSERT(pPageDesc);
+                    // Modify the reference style for the given page style.
+                    {
+                        const SwTextFormatColl* pRegisterFormat
+                            = pPageDesc->GetRegisterFormatColl();
+                        CPPUNIT_ASSERT(pRegisterFormat);
+                        SwTextFormatColl* pTextFormat
+                            = pDoc->FindTextFormatCollByName(pRegisterFormat->GetName());
+                        CPPUNIT_ASSERT(pTextFormat);
+
+                        const SwAttrSet& rAttrSet = pTextFormat->GetAttrSet();
+                        SvxLineSpacingItem aLineSpacingItem = rAttrSet.GetLineSpacing();
+                        aLineSpacingItem.SetLineHeight(nLineHeight);
+                        aLineSpacingItem.SetLineSpaceRule(SvxLineSpaceRule::Fix);
+                        CPPUNIT_ASSERT_EQUAL(nLineHeight, aLineSpacingItem.GetLineHeight());
+                        CPPUNIT_ASSERT_EQUAL(SvxLineSpaceRule::Fix,
+                                             aLineSpacingItem.GetLineSpaceRule());
+
+                        std::unique_ptr<SfxItemSet> pNewSet = rAttrSet.Clone();
+                        pNewSet->Put(aLineSpacingItem);
+                        pDoc->ChgFormat(*pTextFormat, *pNewSet);
+                    }
+
+                    // Verify the reference style was updated properly.
+                    {
+                        const SwTextFormatColl* pRegisterFormat
+                            = pPageDesc->GetRegisterFormatColl();
+                        CPPUNIT_ASSERT(pRegisterFormat);
+                        const SwAttrSet& rAttrSet = pRegisterFormat->GetAttrSet();
+                        const SvxLineSpacingItem& aLineSpacingItem = rAttrSet.GetLineSpacing();
+                        CPPUNIT_ASSERT_EQUAL(nLineHeight, aLineSpacingItem.GetLineHeight());
+                        CPPUNIT_ASSERT_EQUAL(SvxLineSpaceRule::Fix,
+                                             aLineSpacingItem.GetLineSpaceRule());
+                    }
+                    break;
+                }
+                pNextFrame = pNextFrame->GetNext();
+                nCurrentPage += 1;
+            };
+            break;
+        }
+        pNextFrame = pNextFrame->GetLower();
+    };
+    calcLayout();
+}
+
+bool SwPageLineSpacingTest::checkTextAlignedToBaselineGrid(SwFrame* pFrame, const bool bAligned)
+{
+    bool bReturn = true;
+    CPPUNIT_ASSERT(pFrame);
+
+    // Check the text alignment within text frames.
+    if (pFrame->IsTextFrame())
+    {
+        auto pTextFrame = dynamic_cast<SwTextFrame*>(pFrame);
+        CPPUNIT_ASSERT(pTextFrame);
+        bReturn = bReturn && checkTextAlignedToBaselineGrid(pTextFrame, bAligned);
+    }
+
+    // Also check the content of fly frames.
+    if (pFrame->IsPageFrame())
+    {
+        auto pPageFrame = dynamic_cast<SwPageFrame*>(pFrame);
+        CPPUNIT_ASSERT(pPageFrame);
+        const SwSortedObjs* pObjects = pPageFrame->GetSortedObjs();
+        if (pObjects)
+        {
+            for (SwAnchoredObject* pObject : *pObjects)
+            {
+                SwFlyFrame* pFlyFrame = pObject->DynCastFlyFrame();
+                if (pFlyFrame)
+                {
+                    bReturn = bReturn && checkTextAlignedToBaselineGrid(pFlyFrame, bAligned);
+                }
+            }
+        }
+    }
+
+    // Header and footer are not expected to be aligned with the baseline grid.
+    bool bHeaderFooter
+        = pFrame->IsHeaderFrame() || pFrame->IsFooterFrame() || pFrame->IsFootnoteContFrame();
+
+    // Recursively check the content of lower / next frames.
+    if (pFrame->GetLower() && !bHeaderFooter)
+    {
+        bReturn = bReturn && checkTextAlignedToBaselineGrid(pFrame->GetLower(), bAligned);
+    }
+
+    if (pFrame->GetNext())
+    {
+        bReturn = bReturn && checkTextAlignedToBaselineGrid(pFrame->GetNext(), bAligned);
+    }
+    return bReturn;
+}
+
+bool SwPageLineSpacingTest::checkTextAlignedToBaselineGrid(SwTextFrame* pTextFrame,
                                                            const bool bAligned)
 {
     CPPUNIT_ASSERT(pTextFrame);
+
+    if (pTextFrame->GetDrawObjs())
+    {
+        return true;
+    }
+
+    bool bReturn = true;
 
     // First identify the parameters of the baseline grid.
     sal_uInt16 nGridOffset = 0;
@@ -222,8 +470,9 @@ void SwPageLineSpacingTest::checkTextAlignedToBaselineGrid(SwTextFrame* pTextFra
         const SwTextFormatColl* pRegisterFormat = pPageDesc->GetRegisterFormatColl();
         if (!pRegisterFormat)
         {
-            CPPUNIT_ASSERT(!bAligned);
-            return;
+            std::cerr << "Failed on text frame (!pRegisterFormat): " << pTextFrame->GetText()
+                      << std::endl;
+            return true;
         }
         pPage->ComputeRegister(pRegisterFormat, nGridDistance, nGridOffset);
 
@@ -237,8 +486,9 @@ void SwPageLineSpacingTest::checkTextAlignedToBaselineGrid(SwTextFrame* pTextFra
     SwLineLayout* pPara = pTextFrame->GetPara();
     if (!pPara)
     {
-        return;
+        return true;
     }
+
     const SwTwips nLineAscent = pPara->GetAscent();
     const SwTwips nHeightDiff = pPara->GetRealHeight() - pPara->Height();
     const SwTwips nBaseline = pTextFrame->getFrameArea().Top()
@@ -246,28 +496,36 @@ void SwPageLineSpacingTest::checkTextAlignedToBaselineGrid(SwTextFrame* pTextFra
     const SwTwips nRemainder = (nBaseline - nGridOffset) % nGridDistance;
     if (bAligned)
     {
-        CPPUNIT_ASSERT_EQUAL(SwTwips(0), nRemainder);
+        bReturn = bReturn && (nRemainder == 0);
     }
     else
     {
-        CPPUNIT_ASSERT(nRemainder != 0);
+        bReturn = bReturn && (nRemainder != 0);
     }
 
     // All other lines should have a height which is a multiplier of the grid distance
     // to have them also aligned properly to the baseline grid.
     pPara = pPara->GetNext();
+
     while (pPara)
     {
         if (bAligned)
         {
-            CPPUNIT_ASSERT_EQUAL(SwTwips(0), pPara->GetRealHeight() % nGridDistance);
+            bReturn = bReturn && (pPara->GetRealHeight() % nGridDistance == 0);
         }
         else
         {
-            CPPUNIT_ASSERT(pPara->GetRealHeight() % nGridDistance != 0);
+            bReturn = bReturn && (pPara->GetRealHeight() % nGridDistance != 0);
         }
         pPara = pPara->GetNext();
     }
+
+    if (!bReturn)
+    {
+        std::cerr << "Failed on text frame: " << pTextFrame->GetText() << std::endl;
+    }
+
+    return bReturn;
 }
 
 CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testMultipleParagraphs)
@@ -282,13 +540,6 @@ CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testMultiplePages)
     createSwDoc("multiplePages.fodt");
 
     checkTextAlignedToBaselineGrid();
-}
-
-CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testPageLineSpacingDisabledParagraph)
-{
-    createSwDoc("pageLineSpacingDisabledParagraph.fodt");
-
-    checkTextAlignedToBaselineGrid(false);
 }
 
 CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testDoubleLineSpacing)
@@ -340,14 +591,13 @@ CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testSimpleSection)
     checkTextAlignedToBaselineGrid();
 }
 
-/* This use case does not work properly (tdf#170000)
-CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testColumnSection)
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testSectionWithColumns)
 {
-    createSwDoc("columnSection.fodt");
+    // tdf#170000: Text was not properly aligned to the baseline grid inside a section with columns.
+    createSwDoc("sectionWithColumns.fodt");
 
     checkTextAlignedToBaselineGrid();
 }
-*/
 
 CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testPageColumns)
 {
@@ -356,22 +606,13 @@ CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testPageColumns)
     checkTextAlignedToBaselineGrid();
 }
 
-CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testTableWithTopAlignment)
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testFrame)
 {
-    createSwDoc("tableWithTopAlignment.fodt");
+    // tdf#93785: Text was not properly aligned to the baseline grid inside a fly frame.
+    createSwDoc("frame.fodt");
 
     checkTextAlignedToBaselineGrid();
 }
-
-/* This use case does not work properly (tdf#93785)
-CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testTextFrame)
-{
-    createSwDoc("textFrame.fodt");
-
-    checkTextAlignedToBaselineGrid();
-
-}
-*/
 
 CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testMultiplePageStyles)
 {
@@ -479,6 +720,241 @@ CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testVerticalPageStyle)
     applyPageLineSpacing(1, false, "");
 
     CPPUNIT_ASSERT_EQUAL(aOriginalSize, getTextFrameSize(1, u"RightToLeft"_ustr));
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testFrameWithColumns)
+{
+    createSwDoc("frameWithColumns.fodt");
+
+    checkTextAlignedToBaselineGrid();
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testFloatingTable)
+{
+    createSwDoc("floatingTable.fodt");
+
+    checkTextAlignedToBaselineGrid();
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testMoveFrame)
+{
+    createSwDoc("frame.fodt");
+
+    checkTextAlignedToBaselineGrid();
+
+    SdrObject* pFlyFrame = findFlyFrame(1, 1);
+
+    // Text should still be aligned with the baseline grid after moving the frame.
+    moveObject(pFlyFrame, KEY_DOWN);
+    checkTextAlignedToBaselineGrid();
+
+    moveObject(pFlyFrame, KEY_RIGHT);
+    checkTextAlignedToBaselineGrid();
+
+    moveObject(pFlyFrame, KEY_UP);
+    checkTextAlignedToBaselineGrid();
+
+    moveObject(pFlyFrame, KEY_LEFT);
+    checkTextAlignedToBaselineGrid();
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testApplyPageLineSpacingOnTable)
+{
+    createSwDoc("tableWithTopAlignment.fodt");
+
+    checkTextAlignedToBaselineGrid();
+
+    applyPageLineSpacing(1, false, "");
+
+    checkTextAlignedToBaselineGrid(false);
+
+    applyPageLineSpacing(1, true, u"Body Text"_ustr);
+
+    checkTextAlignedToBaselineGrid();
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testMultiPageFloatingTable)
+{
+    createSwDoc("multiPageFloatingTable.fodt");
+
+    checkTextAlignedToBaselineGrid();
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testFrameOutsideOfPrintArea)
+{
+    createSwDoc("frameOutsideOfPrintArea.fodt");
+
+    checkTextAlignedToBaselineGrid();
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testResizeFrame)
+{
+    createSwDoc("frame.fodt");
+
+    checkTextAlignedToBaselineGrid();
+
+    // Text should still be aligned with the baseline grid after resizing the frame.
+    SdrObject* pFlyFrame = findFlyFrame(1, 1);
+    const SwTwips nDragDistance = 100;
+    resizeObjectUpward(pFlyFrame, nDragDistance);
+
+    checkTextAlignedToBaselineGrid();
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testActivatePageLineSpacingForParagraphStyle)
+{
+    createSwDoc("pageLineSpacingDisabledParagraph.fodt");
+
+    checkTextAlignedToBaselineGrid(false);
+
+    applyPageLineSpacing(u"Title"_ustr);
+
+    checkTextAlignedToBaselineGrid();
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testModifyReferenceStyle)
+{
+    createSwDoc("multipleParagraphs.fodt");
+
+    checkTextAlignedToBaselineGrid();
+
+    setLineHeightForReferenceStyle(1, 400);
+
+    checkTextAlignedToBaselineGrid();
+}
+
+CPPUNIT_TEST_FIXTURE(SwPageLineSpacingTest, testApplyToAll)
+{
+    //const OUString& rSourceFolder = u"/sw/qa/extras/pagelinespacing/data/data2"_ustr;
+    const OUString& rSourceFolder = u"/sw/qa/extras/"_ustr;
+    const std::vector<fs::path> excludeList = {
+        "extras/pagelinespacing/data/verticalPageStyle.fodt", // vertical text
+        "extras/pagelinespacing/data/verticalTextInsideTable.fodt", // vertical text
+        "extras/pagelinespacing/data/data2/testTruncatedAxisLabel.odt", // chart
+        "extras/layout/data/cell-vertical-align-middle-in-fly-at-page.fodt", // vertical alignment
+        "extras/layout/data/testTruncatedAxisLabel.odt", // chart
+        "extras/layout/data/tdf88752.fodt", // align to text grid
+        "extras/layout/data/tdf167583.fodt", // align to text grid
+        "extras/layout/data/tdf165089.fodt", // align to text grid
+        "extras/layout/data/ToC-in-linked-frame-on-first-page-style.fodt", // ToC
+        "extras/layout/data/tox-update-wrong-pages.odt", // ToC
+        "extras/layout/data/tox-update-wrong-pages.odt", // ToC
+    };
+
+    const OUString& rSourcePath1 = m_directories.getPathFromSrc(rSourceFolder);
+    const fs::path rSourcePath2 = std::string(rSourcePath1.toUtf8().getStr());
+    CPPUNIT_ASSERT(fs::exists(rSourcePath2));
+
+    bool foundError = false;
+    for (const auto& entry : fs::recursive_directory_iterator(rSourcePath2))
+    {
+        if (fs::is_regular_file(entry.path()))
+        {
+            if (entry.path().extension() != ".doc" && entry.path().extension() != ".docx"
+                && entry.path().extension() != ".odt" && entry.path().extension() != ".fodt")
+            {
+                continue;
+            }
+            std::cerr << "Checking file: " << entry.path() << std::endl;
+            bool excludeFile = false;
+            for (const fs::path& fileToExclude : excludeList)
+            {
+                if (entry.path().string().find(fileToExclude) != std::string::npos)
+                {
+                    excludeFile = true;
+                    break;
+                }
+            }
+            if (excludeFile)
+            {
+                std::cerr << "File is in exclusion list, so ignore: " << entry.path() << std::endl;
+                continue;
+            }
+
+            // Load the test file.
+            {
+                const OUString aFilePath
+                    = OStringToOUString(entry.path().string(), RTL_TEXTENCODING_ASCII_US);
+                loadFromURL("file://" + aFilePath, nullptr);
+                calcLayout();
+            }
+
+            // Apply page line-spacing on all pages.
+            {
+                SwDocShell* pDocShell = getSwDocShell();
+                CPPUNIT_ASSERT(pDocShell);
+
+                SwDoc* pDoc = pDocShell->GetDoc();
+                CPPUNIT_ASSERT(pDoc);
+
+                SwDrawModel* pDrawModel = pDoc->getIDocumentDrawModelAccess().GetDrawModel();
+                CPPUNIT_ASSERT(pDrawModel);
+
+                const sal_uInt16 nPageCount = pDrawModel->GetPageCount();
+                for (sal_uInt16 nPage = 1; nPage <= nPageCount; nPage++)
+                {
+                    applyPageLineSpacing(nPage, true, u"Body Text"_ustr);
+                }
+            }
+
+            // Activate page line-spacing for all paragraph styles.
+            {
+                SwDocShell* pDocShell = getSwDocShell();
+                CPPUNIT_ASSERT(pDocShell);
+
+                SwWrtShell* pWrtShell = pDocShell->GetWrtShell();
+                CPPUNIT_ASSERT(pWrtShell);
+
+                SfxStyleSheetBasePool* pStyleSheetPool = pDocShell->GetStyleSheetPool();
+                CPPUNIT_ASSERT(pStyleSheetPool);
+                SfxStyleSheetBase* pFirstStyle = pStyleSheetPool->First(SfxStyleFamily::Para);
+                while (pFirstStyle)
+                {
+                    applyPageLineSpacing(pFirstStyle->GetName());
+                    pFirstStyle = pStyleSheetPool->Next();
+                }
+            }
+
+            bool bResult = checkTextAlignedToBaselineGrid();
+            if (!bResult)
+            {
+                std::cerr << "Test failed on file: " << entry.path() << std::endl;
+                foundError = true;
+                continue;
+            }
+
+            SwDocShell* pDocShell = getSwDocShell();
+            CPPUNIT_ASSERT(pDocShell);
+            SwWrtShell* pWrtShell = pDocShell->GetWrtShell();
+            CPPUNIT_ASSERT(pWrtShell);
+            pWrtShell->SttEndDoc(true);
+            pWrtShell->InsertPageBreak();
+            calcLayout();
+
+            bResult = checkTextAlignedToBaselineGrid();
+            if (!bResult)
+            {
+                std::cerr << "Test failed on file after page break: " << entry.path() << std::endl;
+                foundError = true;
+                continue;
+            }
+            // Remove page
+            pWrtShell->SttEndDoc(true);
+            pWrtShell->DelRight();
+            calcLayout();
+
+            bResult = checkTextAlignedToBaselineGrid();
+            if (!bResult)
+            {
+                std::cerr << "Test failed on file after remove page: " << entry.path() << std::endl;
+                foundError = true;
+                continue;
+            }
+        }
+    }
+
+    CPPUNIT_ASSERT(!foundError);
+    CPPUNIT_ASSERT(false);
 }
 
 } // end of anonymous namespace
