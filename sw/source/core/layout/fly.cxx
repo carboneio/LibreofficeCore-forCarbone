@@ -126,7 +126,7 @@ SwTwips GetFlyAnchorBottom(SwFlyFrame* pFly, const SwFrame& rAnchor)
         return 0;
     }
 
-    if (isLegacyBehavior(pFly , rAnchor))
+    if (isLegacyBehavior(&rFly, rAnchor))
     {
         // Word <= 2010 style: the fly can overlap with the bottom margin / footer area in case the
         // fly height fits the body height and the fly bottom fits the page.
